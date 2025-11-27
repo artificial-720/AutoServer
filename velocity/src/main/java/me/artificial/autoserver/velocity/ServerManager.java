@@ -25,6 +25,7 @@ public class ServerManager {
     private final AutoServerLogger logger;
     private final AutoServer plugin;
     private final HashSet<String> startingServers = new HashSet<>();
+    private final HashMap<String, Long> serverStartTimes = new HashMap<>();
     private final HashMap<Player, String> queuePlayers = new HashMap<>();
     private final Map<String, ServerStatus> serverStatusCache = new ConcurrentHashMap<>();
     private final Map<String, ScheduledTask> shutdownScheduledTask = new ConcurrentHashMap<>();
@@ -50,6 +51,7 @@ public class ServerManager {
         }
 
         startingServers.add(serverName);
+        serverStartTimes.put(serverName, System.currentTimeMillis());
 
         logger.debug("Attempting to start server: {}", serverName);
 
@@ -60,7 +62,7 @@ public class ServerManager {
         return isServerOnline(server)
                 .thenCompose(isOnline -> {
                     if (isOnline) {
-                        // Already running
+                        serverStartTimes.remove(serverName);
                         moveQueuedPlayersToServer(server);
                         return CompletableFuture.completedFuture("Server already running");
                     }
@@ -83,6 +85,7 @@ public class ServerManager {
                     // clean up
                     startingServers.remove(serverName);
                     if (ex != null) {
+                        serverStartTimes.remove(serverName);
                         logger.error("Failed to start server: {}", ex.getMessage());
                     }
                 });
@@ -131,12 +134,12 @@ public class ServerManager {
 
 
                                 return isServerOnline(server).thenApply(isOnline2 -> {
-                                        if (isOnline2) {
-                                            throw new RuntimeException("Failed to stop server.");
-                                        } else {
-                                            return "Server stopped.";
-                                        }
-                                    });
+                                    if (isOnline2) {
+                                        throw new RuntimeException("Failed to stop server.");
+                                    } else {
+                                        return "Server stopped.";
+                                    }
+                                });
                             });
                 })
                 .whenComplete((result, ex) -> {
@@ -146,6 +149,7 @@ public class ServerManager {
                         getServerStatus(server).setStatus(ServerStatus.Status.UNKNOWN);
                     } else {
                         getServerStatus(server).setStatus(ServerStatus.Status.STOPPED);
+                        serverStartTimes.remove(serverName);
                     }
                 });
     }
@@ -265,7 +269,15 @@ public class ServerManager {
                         return null;
                     }
 
-                    scheduleShutdownServer(server);
+                    final long startTime = this.serverStartTimes.get(serverName);
+                    final long now = System.currentTimeMillis();
+
+                    final long gracePeriodMs = this.plugin.getConfig().getMaintenanceInterval() * 60_000L;
+
+                    if (now - startTime >= gracePeriodMs) {
+                        this.scheduleShutdownServer(server);
+                    }
+
                 }
                 return null;
             });
