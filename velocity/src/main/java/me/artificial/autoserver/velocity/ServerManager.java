@@ -16,6 +16,8 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * A ServerManager class that manages the state of servers, including starting, stopping,
@@ -28,6 +30,7 @@ public class ServerManager {
     private final HashMap<Player, String> queuePlayers = new HashMap<>();
     private final Map<String, ServerStatus> serverStatusCache = new ConcurrentHashMap<>();
     private final Map<String, ScheduledTask> shutdownScheduledTask = new ConcurrentHashMap<>();
+    private final Object shutdownTaskLock = new Object();
 
     public ServerManager(AutoServer plugin) {
         this.plugin = plugin;
@@ -96,8 +99,18 @@ public class ServerManager {
      *         or completes exceptionally if an error occurs or the server is already stopped.
      */
     public CompletableFuture<String> stopServer(RegisteredServer server) {
+        return stopServer(server, false);
+    }
+
+    private CompletableFuture<String> stopServer(RegisteredServer server, boolean automatic) {
         // Check if already stopping
         String serverName = server.getServerInfo().getName();
+        AtomicBoolean aborted = new AtomicBoolean();
+        if (automatic && !server.getPlayersConnected().isEmpty()) {
+            logger.info("Skipping automatic shutdown of server {} because players are connected", serverName);
+            return CompletableFuture.completedFuture("Server has players connected.");
+        }
+
         if (getServerStatus(server).isStopping()) {
             logger.debug("Server {} is already stopping", serverName);
             return CompletableFuture.completedFuture("Server is already stopping.");
@@ -113,6 +126,11 @@ public class ServerManager {
                 .thenCompose(isOnline -> {
                     if (!isOnline) {
                         return CompletableFuture.completedFuture("Server already stopped");
+                    }
+                    if (automatic && !server.getPlayersConnected().isEmpty()) {
+                        aborted.set(true);
+                        logger.info("Skipping automatic shutdown of server {} because players are connected", serverName);
+                        return CompletableFuture.completedFuture("Server has players connected.");
                     }
 
                     // Finally stop the server using the given strategy
@@ -141,7 +159,9 @@ public class ServerManager {
                 })
                 .whenComplete((result, ex) -> {
                     // clean up
-                    if (ex != null) {
+                    if (aborted.get()) {
+                        getServerStatus(server).setStatus(ServerStatus.Status.RUNNING);
+                    } else if (ex != null) {
                         logger.error("Failed to stop server: {}", ex.getMessage());
                         getServerStatus(server).setStatus(ServerStatus.Status.UNKNOWN);
                     } else {
@@ -220,37 +240,60 @@ public class ServerManager {
      */
     public void scheduleShutdownServer(RegisteredServer server) {
         assert server != null;
-        logger.trace("scheduleShutdownServer: {}", server.getServerInfo().getName());
+        String serverName = server.getServerInfo().getName();
+        logger.trace("scheduleShutdownServer: {}", serverName);
         long autoShutdownDelay = plugin.getConfig().getAutoShutdownDelay(server);
         if (autoShutdownDelay <= 0) {
             return;
         }
 
-        assert !shutdownScheduledTask.containsKey(server.getServerInfo().getName()) : "Server already has task scheduled for shutdown.";
-        logger.info("Scheduling shutdown of server {} in {}", server.getServerInfo().getName(), autoShutdownDelay);
+        if (!canAutoShutdown(server)) {
+            logger.trace("Skipping automatic shutdown of server {} because it is not empty or is stopping", serverName);
+            return;
+        }
 
-        Scheduler.TaskBuilder taskBuilder = plugin.getProxy().getScheduler()
-                .buildTask(plugin,() -> {
-                    assert server.getPlayersConnected().isEmpty() : "Server is not empty";
-                    stopServer(server).whenComplete((result, ex) -> {
-                        if (ex != null) {
-                            logger.error("error: {}", ex.getMessage());
-                        } else {
-                            logger.info("Message: {}", result);
+        synchronized (shutdownTaskLock) {
+            if (shutdownScheduledTask.containsKey(serverName)) {
+                logger.trace("Server {} is already scheduled to stop", serverName);
+                return;
+            }
+
+            logger.info("Scheduling shutdown of server {} in {}", serverName, autoShutdownDelay);
+            AtomicReference<ScheduledTask> taskReference = new AtomicReference<>();
+            ScheduledTask scheduledTask = plugin.getProxy().getScheduler()
+                    .buildTask(plugin, () -> {
+                        ScheduledTask task = taskReference.get();
+                        if (task != null) {
+                            shutdownScheduledTask.remove(serverName, task);
                         }
-                    });
-                }).delay(Duration.ofSeconds(autoShutdownDelay));
 
-        ScheduledTask scheduledTask = taskBuilder.schedule();
-        shutdownScheduledTask.put(server.getServerInfo().getName(), scheduledTask);
+                        if (!canAutoShutdown(server)) {
+                            logger.info("Skipping automatic shutdown of server {} because it is no longer empty", serverName);
+                            return;
+                        }
+
+                        stopServer(server, true).whenComplete((result, ex) -> {
+                            if (ex != null) {
+                                logger.error("error: {}", ex.getMessage());
+                            } else {
+                                logger.info("Message: {}", result);
+                            }
+                        });
+                    }).delay(Duration.ofSeconds(autoShutdownDelay)).schedule();
+            taskReference.set(scheduledTask);
+            shutdownScheduledTask.put(serverName, scheduledTask);
+        }
     }
 
     public void cancelShutdownServer(RegisteredServer server) {
         String serverName = server.getServerInfo().getName();
-        if (shutdownScheduledTask.containsKey(serverName)) {
+        ScheduledTask scheduledTask;
+        synchronized (shutdownTaskLock) {
+            scheduledTask = shutdownScheduledTask.remove(serverName);
+        }
+        if (scheduledTask != null) {
             logger.info("Cancelling auto shutdown: {}", serverName);
-            shutdownScheduledTask.get(serverName).cancel();
-            shutdownScheduledTask.remove(serverName);
+            scheduledTask.cancel();
         }
     }
 
@@ -259,17 +302,20 @@ public class ServerManager {
         for (RegisteredServer server : servers) {
             pingServer(server, 5000).thenApply((isOnline) -> {
                 if (isOnline && server.getPlayersConnected().isEmpty()) {
-                    String serverName = server.getServerInfo().getName();
-                    if (shutdownScheduledTask.containsKey(serverName)) {
-                        logger.trace("Server {} is already scheduled to stop", serverName);
-                        return null;
-                    }
-
                     scheduleShutdownServer(server);
                 }
                 return null;
             });
         }
+    }
+
+    private boolean canAutoShutdown(RegisteredServer server) {
+        if (!server.getPlayersConnected().isEmpty()) {
+            return false;
+        }
+
+        ServerStatus status = serverStatusCache.get(server.getServerInfo().getName());
+        return status == null || !status.isStopping();
     }
 
     private Startable getServerStrategy(RegisteredServer server) {

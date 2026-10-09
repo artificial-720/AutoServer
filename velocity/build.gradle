@@ -7,6 +7,13 @@ dependencies {
     implementation project(":common")
     compileOnly "com.velocitypowered:velocity-api:${project.velocity_version}"
 //    annotationProcessor "com.velocitypowered:velocity-api:3.3.0-SNAPSHOT"
+    testImplementation "com.velocitypowered:velocity-api:${project.velocity_version}"
+    testImplementation "org.junit.jupiter:junit-jupiter:5.11.4"
+    testImplementation "org.mockito:mockito-core:5.18.0"
+}
+
+tasks.withType(Test).configureEach {
+    useJUnitPlatform()
 }
 
 processResources {
