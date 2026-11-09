@@ -184,6 +184,7 @@ public class AutoServer {
         Player player = event.getPlayer();
         Optional<ServerConnection> serverConnection = player.getCurrentServer();
         if (serverConnection.isEmpty()) {
+            logger.trace("Disconnect player connection is empty");
             return;
         }
         RegisteredServer server = serverConnection.get().getServer();
@@ -196,6 +197,7 @@ public class AutoServer {
                 others++;
             }
         }
+        logger.trace("Disconnect server player count: {}", others);
         if (others <= 0) {
             serverManager.scheduleShutdownServer(server);
         }
